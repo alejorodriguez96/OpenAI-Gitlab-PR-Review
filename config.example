@@ -1,0 +1,16 @@
+# Configuración de OpenAI
+OPENAI_API_KEY=tu_clave_de_openai_aqui
+OPENAI_API_MODEL=gpt-3.5-turbo
+
+# Configuración de Azure OpenAI (opcional)
+# AZURE_OPENAI_API_BASE=https://tu-recurso.openai.azure.com/
+# AZURE_OPENAI_API_VERSION=2023-05-15
+
+# Configuración de GitLab
+GITLAB_TOKEN=tu_token_de_gitlab_aqui
+GITLAB_URL=https://gitlab.com/api/v4
+EXPECTED_GITLAB_TOKEN=tu_token_esperado_para_webhooks
+
+# Configuración del servidor
+FLASK_ENV=production
+PORT=8080
