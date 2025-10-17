@@ -160,15 +160,17 @@ def process_merge_request(payload):
         logger.info(f"Modelo a usar: {os.environ.get('OPENAI_API_MODEL', 'gpt-3.5-turbo')}")
         
         try:
-            completions = openai.ChatCompletion.create(
-                deployment_id=os.environ.get("OPENAI_API_MODEL"),
-                model=os.environ.get("OPENAI_API_MODEL") or "gpt-3.5-turbo",
-                temperature=0.2,
-                stream=False,
-                messages=messages
+            client = openai.OpenAI(
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                base_url="https://api.groq.com/openai/v1"
+            )
+            response = client.responses.create(
+                model="llama-3.1-8b-instant",
+                input='\n\n'.join([message["content"] for message in messages]),
             )
             logger.info("Respuesta de OpenAI recibida exitosamente")
-            answer = completions.choices[0].message["content"].strip()
+            logger.info(f"Metricas: {response.usage}")
+            answer = response.output_text.strip()
             answer += "\n\nEste comentario fue generado por un pato de inteligencia artificial."
         except Exception as e:
             logger.error(f"Error al llamar a OpenAI: {e}")
