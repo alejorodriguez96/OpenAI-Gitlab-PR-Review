@@ -3,7 +3,7 @@ import json
 import requests
 import logging
 from flask import Flask, request
-import openai
+from openai import OpenAI
 
 # Configuración de logging
 logging.basicConfig(
@@ -35,19 +35,28 @@ def validate_environment():
     logger.info("Todas las variables de entorno están configuradas correctamente")
 
 # Configuración de OpenAI
-openai.api_key = os.environ.get("OPENAI_API_KEY")
 gitlab_token = os.environ.get("GITLAB_TOKEN")
 gitlab_url = os.environ.get("GITLAB_URL")
 
-api_base = os.environ.get("AZURE_OPENAI_API_BASE")
-if api_base is not None:
-    openai.api_base = api_base
-    logger.info(f"Usando Azure OpenAI con base URL: {api_base}")
+# Inicializar cliente de OpenAI para Responses API
+def get_openai_client():
+    """Inicializa y retorna el cliente de OpenAI configurado para Responses API"""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    api_base = os.environ.get("AZURE_OPENAI_API_BASE")
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION")
+    
+    if api_base is not None:
+        logger.info(f"Usando Azure OpenAI con base URL: {api_base}")
+        return OpenAI(
+            api_key=api_key,
+            base_url=api_base,
+            default_headers={"api-version": api_version} if api_version else None
+        )
+    else:
+        return OpenAI(api_key=api_key)
 
-openai.api_version = os.environ.get("AZURE_OPENAI_API_VERSION")
-if openai.api_version is not None:
-    openai.api_type = "azure"
-    logger.info(f"Configurado para usar Azure OpenAI con versión: {openai.api_version}")
+# Cliente global de OpenAI (se inicializa cuando se necesita)
+openai_client = get_openai_client()
 
 # Validar configuración al inicio
 try:
@@ -150,27 +159,21 @@ def process_merge_request(payload):
         10. ¿Sugerencias para alineación con mejores prácticas?
         """
 
-        messages = [
-            {"role": "system", "content": "Eres un desarrollador senior especializado en arquitectura de software, revisando cambios de código con enfoque en arquitectura hexagonal, separación de responsabilidades, orientación a objetos y mejores prácticas de desarrollo."},
-            {"role": "user", "content": f"{pre_prompt}\n\n{''.join(diffs)}{questions}"},
-            {"role": "assistant", "content": "Responde en markdown compatible con GitLab. Incluye una versión concisa de cada pregunta en tu respuesta, prestando especial atención a los aspectos arquitectónicos y de diseño."},
-        ]
-
-        logger.info("Enviando solicitud a OpenAI...")
+        # Preparar el input para la API de Responses
+        input_text = f"{pre_prompt}\n\n{''.join(diffs)}{questions}"
+        
+        logger.info("Enviando solicitud a OpenAI usando Responses API...")
         logger.info(f"Modelo a usar: {os.environ.get('OPENAI_API_MODEL', 'gpt-3.5-turbo')}")
         
-        try:
-            client = openai.OpenAI(
-                api_key=os.environ.get("OPENAI_API_KEY"),
-                base_url="https://api.groq.com/openai/v1"
-            )
-            response = client.responses.create(
-                model="llama-3.1-8b-instant",
-                input='\n\n'.join([message["content"] for message in messages]),
+        try:            
+            # Usar la API de Responses
+            response = openai_client.responses.create(
+                model=os.environ.get("OPENAI_API_MODEL") or "gpt-3.5-turbo",
+                input=input_text,
+                instructions="Eres un desarrollador senior especializado en arquitectura de software, revisando cambios de código con enfoque en arquitectura hexagonal, separación de responsabilidades, orientación a objetos y mejores prácticas de desarrollo. Responde en markdown compatible con GitLab. Incluye una versión concisa de cada pregunta en tu respuesta, prestando especial atención a los aspectos arquitectónicos y de diseño."
             )
             logger.info("Respuesta de OpenAI recibida exitosamente")
-            logger.info(f"Metricas: {response.usage}")
-            answer = response.output_text.strip()
+            answer = response.output[0].content[0].text.strip()
             answer += "\n\nEste comentario fue generado por un pato de inteligencia artificial."
         except Exception as e:
             logger.error(f"Error al llamar a OpenAI: {e}")
@@ -246,25 +249,26 @@ def process_push_event(payload):
         9. ¿El código está bien orientado a objetos (encapsulación, herencia, polimorfismo)?
         """
 
-        messages = [
-            {"role": "system", "content": "Eres un desarrollador senior especializado en arquitectura de software, revisando cambios de código de un commit con enfoque en arquitectura hexagonal, separación de responsabilidades, orientación a objetos y mejores prácticas de desarrollo."},
-            {"role": "user", "content": f"{pre_prompt}\n\n{changes_string}{questions}"},
-            {"role": "assistant", "content": "Responde en markdown para GitLab. Incluye versiones concisas de las preguntas en la respuesta, prestando especial atención a los aspectos arquitectónicos y de diseño."},
-        ]
-
-        logger.info("Enviando solicitud a OpenAI para revisión de commit...")
+        # Preparar el input para la API de Responses
+        input_text = f"{pre_prompt}\n\n{changes_string}{questions}"
+        
+        logger.info("Enviando solicitud a OpenAI para revisión de commit usando Responses API...")
         logger.info(f"Modelo a usar: {os.environ.get('OPENAI_API_MODEL', 'gpt-3.5-turbo')}")
         
         try:
-            completions = openai.ChatCompletion.create(
-                deployment_id=os.environ.get("OPENAI_API_MODEL"),
+            # Inicializar cliente si no está inicializado
+            global openai_client
+            if openai_client is None:
+                openai_client = get_openai_client()
+            
+            # Usar la API de Responses
+            response = openai_client.responses.create(
                 model=os.environ.get("OPENAI_API_MODEL") or "gpt-3.5-turbo",
-                temperature=0.7,
-                stream=False,
-                messages=messages
+                input=input_text,
+                instructions="Eres un desarrollador senior especializado en arquitectura de software, revisando cambios de código de un commit con enfoque en arquitectura hexagonal, separación de responsabilidades, orientación a objetos y mejores prácticas de desarrollo. Responde en markdown para GitLab. Incluye versiones concisas de las preguntas en la respuesta, prestando especial atención a los aspectos arquitectónicos y de diseño."
             )
             logger.info("Respuesta de OpenAI recibida exitosamente")
-            answer = completions.choices[0].message["content"].strip()
+            answer = response.output[0].content[0].text.strip()
             answer += "\n\nPara referencia, me dieron las siguientes preguntas: \n"
             for question in questions.split("\n"):
                 answer += f"\n{question}"
@@ -306,10 +310,11 @@ def health_check():
     
     status = {
         "status": "healthy",
-        "openai_configured": bool(openai.api_key),
+        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
         "gitlab_configured": bool(gitlab_token and gitlab_url),
         "expected_token_configured": bool(os.environ.get("EXPECTED_GITLAB_TOKEN")),
-        "azure_configured": bool(os.environ.get("AZURE_OPENAI_API_BASE"))
+        "azure_configured": bool(os.environ.get("AZURE_OPENAI_API_BASE")),
+        "api_type": "responses"
     }
     
     all_configured = all(status.values())
@@ -343,11 +348,11 @@ def internal_error(error):
 if __name__ == '__main__':
     logger.info("=== INICIANDO APLICACIÓN ===")
     logger.info(f"Configuración de OpenAI:")
-    logger.info(f"  - API Key configurada: {'Sí' if openai.api_key else 'No'}")
-    logger.info(f"  - API Base: {getattr(openai, 'api_base', 'No configurado')}")
-    logger.info(f"  - API Type: {getattr(openai, 'api_type', 'openai')}")
-    logger.info(f"  - API Version: {getattr(openai, 'api_version', 'No configurado')}")
+    logger.info(f"  - API Key configurada: {'Sí' if os.environ.get('OPENAI_API_KEY') else 'No'}")
+    logger.info(f"  - API Base: {os.environ.get('AZURE_OPENAI_API_BASE', 'No configurado')}")
+    logger.info(f"  - API Version: {os.environ.get('AZURE_OPENAI_API_VERSION', 'No configurado')}")
     logger.info(f"  - Modelo: {os.environ.get('OPENAI_API_MODEL', 'gpt-3.5-turbo')}")
+    logger.info(f"  - API Type: Responses API")
     logger.info(f"Configuración de GitLab:")
     logger.info(f"  - URL: {gitlab_url}")
     logger.info(f"  - Token configurado: {'Sí' if gitlab_token else 'No'}")
