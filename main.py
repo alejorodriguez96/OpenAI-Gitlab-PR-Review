@@ -173,14 +173,17 @@ def process_merge_request(payload):
                 instructions="Eres un desarrollador senior especializado en arquitectura de software, revisando cambios de código con enfoque en arquitectura hexagonal, separación de responsabilidades, orientación a objetos y mejores prácticas de desarrollo. Responde en markdown compatible con GitLab. Incluye una versión concisa de cada pregunta en tu respuesta, prestando especial atención a los aspectos arquitectónicos y de diseño."
             )
             logger.info("Respuesta de OpenAI recibida exitosamente")
-            answer = response.output[0].content[0].text.strip()
-            answer += "\n\nEste comentario fue generado por un pato de inteligencia artificial."
+            answer = response.output_text.strip()
+            answer += "\n\nEste comentario fue generado por inteligencia artificial."
         except Exception as e:
             logger.error(f"Error al llamar a OpenAI: {e}")
             answer = "Lo siento, no me siento bien hoy. Por favor, pide a un humano que revise este PR."
-            answer += "\n\nEste comentario fue generado por un pato de inteligencia artificial."
+            answer += "\n\nEste comentario fue generado por inteligencia artificial."
             answer += f"\n\nError: {str(e)}"
-
+        try:
+            logger.info(f"Metricas: {response.usage}")
+        except Exception as e:
+            logger.error(f"Error al obtener metricas: {e}")
         logger.info(f"Respuesta generada (longitud: {len(answer)} caracteres)")
         logger.info(f"Respuesta: {answer[:200]}...")
         
