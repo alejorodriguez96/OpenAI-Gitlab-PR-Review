@@ -2,7 +2,7 @@ import os
 import json
 import requests
 import logging
-from flask import Flask, request
+from flask import Flask, request, render_template_string
 from openai import OpenAI
 
 # Configuración de logging
@@ -207,6 +207,118 @@ def process_merge_request(payload):
     except Exception as e:
         logger.error(f"Error inesperado procesando MR: {e}")
         return f"Error procesando MR: {e}", 500
+
+
+def extract_mr_iid_from_url(mr_url):
+    """Extrae el IID del MR desde una URL de GitLab."""
+    try:
+        # Ejemplos válidos:
+        # https://gitlab.com/grupo/proyecto/-/merge_requests/123
+        # https://gitlab.com/grupo/proyecto/merge_requests/123
+        parts = mr_url.rstrip("/").split("/")
+        iid_str = parts[-1]
+        if not iid_str.isdigit():
+            return None
+        return int(iid_str)
+    except Exception as e:
+        logger.error(f"No se pudo extraer el IID del MR desde la URL '{mr_url}': {e}")
+        return None
+
+
+def build_ai_review_for_mr(project_id, mr_iid):
+    """Genera el texto de la review de MR usando OpenAI."""
+    changes_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}/changes"
+    logger.info(f"URL de cambios para review manual: {changes_url}")
+
+    headers = {"Private-Token": gitlab_token}
+    logger.info("Obteniendo cambios del MR desde GitLab (review manual)...")
+
+    response = requests.get(changes_url, headers=headers)
+    logger.info(f"Respuesta de GitLab - Status: {response.status_code}")
+
+    if response.status_code != 200:
+        logger.error(f"Error al obtener cambios del MR: {response.status_code} - {response.text}")
+        raise RuntimeError(f"Error al obtener cambios del MR: {response.status_code}")
+
+    mr_changes = response.json()
+    logger.info(f"Cambios obtenidos: {len(mr_changes.get('changes', []))} archivos modificados")
+
+    diffs = [change["diff"] for change in mr_changes.get("changes", [])]
+    logger.info(f"Total de diffs: {len(diffs)}")
+
+    pre_prompt = (
+        "Revisa los siguientes cambios de código git diff, enfocándote en estructura, seguridad, claridad, "
+        "arquitectura hexagonal, separación de responsabilidades y orientación a objetos."
+    )
+
+    questions = """
+    Preguntas:
+    1. Resume los cambios principales.
+    2. ¿Es claro el código nuevo/modificado?
+    3. ¿Son descriptivos los comentarios y nombres?
+    4. ¿Se puede reducir la complejidad? ¿Ejemplos?
+    5. ¿Algún bug? ¿Dónde?
+    6. ¿Problemas de seguridad potenciales?
+    7. ¿Los cambios respetan la arquitectura hexagonal (puertos y adaptadores)?
+    8. ¿Hay una adecuada separación de incumbencias (responsabilidades)?
+    9. ¿El código está bien orientado a objetos (encapsulación, herencia, polimorfismo)?
+    10. ¿Sugerencias para alineación con mejores prácticas?
+    """
+
+    input_text = f"{pre_prompt}\n\n{''.join(diffs)}{questions}"
+
+    logger.info("Enviando solicitud a OpenAI usando Responses API (review manual)...")
+    logger.info(f"Modelo a usar: {os.environ.get('OPENAI_API_MODEL', 'gpt-3.5-turbo')}")
+
+    try:
+        response = openai_client.responses.create(
+            model=os.environ.get("OPENAI_API_MODEL") or "gpt-3.5-turbo",
+            input=input_text,
+            instructions=(
+                "Eres un desarrollador senior especializado en arquitectura de software, revisando cambios de "
+                "código con enfoque en arquitectura hexagonal, separación de responsabilidades, orientación a "
+                "objetos y mejores prácticas de desarrollo. Responde en markdown compatible con GitLab. "
+                "Incluye una versión concisa de cada pregunta en tu respuesta, prestando especial atención a los "
+                "aspectos arquitectónicos y de diseño."
+            ),
+        )
+        logger.info("Respuesta de OpenAI recibida exitosamente (review manual)")
+        answer = response.output_text.strip()
+        answer += "\n\nEste comentario fue generado por inteligencia artificial."
+    except Exception as e:
+        logger.error(f"Error al llamar a OpenAI (review manual): {e}")
+        answer = (
+            "Lo siento, no me siento bien hoy. Por favor, pide a un humano que revise este MR.\n\n"
+            "Este comentario fue generado por inteligencia artificial.\n\n"
+            f"Error: {str(e)}"
+        )
+
+    try:
+        logger.info(f"Métricas de OpenAI (review manual): {response.usage}")
+    except Exception as e:
+        logger.error(f"Error al obtener métricas (review manual): {e}")
+
+    logger.info(f"Respuesta generada (review manual, longitud: {len(answer)} caracteres)")
+    logger.info(f"Respuesta (primeros 200 chars): {answer[:200]}...")
+
+    return answer
+
+
+def create_pending_review_draft_note(project_id, mr_iid, body):
+    """Crea un draft note en el MR, dejando la review en estado pendiente."""
+    draft_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}/draft_notes"
+    headers = {"Private-Token": gitlab_token}
+    payload = {"note": body}
+
+    logger.info(f"Creando draft note (review pendiente) en: {draft_url}")
+    response = requests.post(draft_url, headers=headers, json=payload)
+    logger.info(f"Respuesta de GitLab al crear draft note - Status: {response.status_code}")
+
+    if response.status_code != 201:
+        logger.error(f"Error al crear draft note: {response.text}")
+        raise RuntimeError(f"Error al crear draft note: {response.status_code}")
+
+    logger.info("Draft note creado exitosamente; la review queda en estado pendiente.")
 def process_push_event(payload):
     """Procesa eventos de Push"""
     try:
@@ -329,14 +441,329 @@ def health_check():
 
 @app.route('/', methods=['GET'])
 def root():
-    """Endpoint raíz con información básica"""
+    """Endpoint raíz con información básica y acceso al formulario de review manual."""
     logger.info("Solicitud al endpoint raíz")
-    return """
-    <h1>Revisor de Código con IA</h1>
-    <p>Esta aplicación revisa automáticamente cambios de código en GitLab usando OpenAI.</p>
-    <p><a href="/health">Health Check</a></p>
-    <p>Webhook endpoint: <code>POST /webhook</code></p>
-    """, 200
+    html = """
+    <html>
+      <head>
+        <title>Revisor de Código con IA</title>
+        <style>
+          body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; background: #f5f5f7; color: #111827; }
+          .card { max-width: 640px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 1.75rem 2rem; box-shadow: 0 18px 45px rgba(15,23,42,0.12); border: 1px solid #e5e7eb; }
+          h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+          p { margin: 0.25rem 0 0.75rem 0; line-height: 1.6; }
+          .muted { color: #6b7280; font-size: 0.95rem; }
+          .links { margin-top: 1.25rem; display: flex; flex-direction: column; gap: 0.5rem; }
+          a { color: #2563eb; text-decoration: none; font-weight: 500; }
+          a:hover { text-decoration: underline; }
+          .pill { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; padding: 0.15rem 0.55rem; border-radius: 999px; background: #eff6ff; color: #1d4ed8; font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="pill">GitLab · OpenAI</div>
+          <h1>Revisor de Código con IA</h1>
+          <p class="muted">
+            Esta aplicación revisa automáticamente cambios de código en GitLab usando OpenAI, tanto por webhooks
+            como manualmente a partir de un enlace a Merge Request.
+          </p>
+          <div class="links">
+            <a href="/review">➜ Abrir formulario de review manual</a>
+            <a href="/health">➜ Health Check</a>
+            <span class="muted">Webhook endpoint: <code>POST /webhook</code></span>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    return html, 200
+
+
+REVIEW_FORM_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Review manual de Merge Request</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 0; background: #f5f5f7; color: #111827; }
+      .page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; }
+      .card { width: 100%; max-width: 720px; background: #ffffff; border-radius: 16px; padding: 2rem 2.25rem 2.25rem; box-shadow: 0 22px 55px rgba(15,23,42,0.13); border: 1px solid #e5e7eb; }
+      h1 { font-size: 1.7rem; margin: 0 0 0.25rem 0; }
+      .subtitle { margin: 0 0 1.5rem 0; color: #6b7280; font-size: 0.95rem; }
+      form { display: flex; flex-direction: column; gap: 1.1rem; margin-top: 0.5rem; }
+      label { font-weight: 500; font-size: 0.92rem; color: #374151; display: block; margin-bottom: 0.25rem; }
+      input[type="text"], input[type="password"] {
+        width: 100%;
+        padding: 0.6rem 0.75rem;
+        border-radius: 0.6rem;
+        border: 1px solid #d1d5db;
+        font-size: 0.95rem;
+        outline: none;
+        background: #f9fafb;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+      }
+      input[type="text"]:focus, input[type="password"]:focus {
+        border-color: #2563eb;
+        box-shadow: 0 0 0 1px rgba(37,99,235,0.18);
+        background: #ffffff;
+      }
+      .hint { font-size: 0.8rem; color: #9ca3af; margin-top: 0.15rem; }
+      .actions { display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1.25rem; align-items: center; flex-wrap: wrap; }
+      .btn-primary {
+        background: linear-gradient(135deg, #2563eb, #1d4ed8);
+        color: #ffffff;
+        border: none;
+        border-radius: 999px;
+        padding: 0.55rem 1.3rem;
+        font-size: 0.93rem;
+        font-weight: 600;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        box-shadow: 0 14px 30px rgba(37,99,235,0.35);
+        transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+      }
+      .btn-primary:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 16px 36px rgba(37,99,235,0.45);
+      }
+      .btn-primary:active {
+        transform: translateY(0);
+        box-shadow: 0 10px 24px rgba(37,99,235,0.3);
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.18rem 0.65rem;
+        border-radius: 999px;
+        background: #ecfdf5;
+        color: #047857;
+        font-size: 0.78rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        font-size: 0.78rem;
+        padding: 0.18rem 0.6rem;
+        border-radius: 999px;
+        background: #eff6ff;
+        color: #1d4ed8;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .top-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; gap: 1rem; flex-wrap: wrap; }
+      .status {
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.65rem;
+        font-size: 0.85rem;
+        margin-top: 0.75rem;
+      }
+      .status-ok { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+      .status-error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+      .status-neutral { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+      .status-title { font-weight: 600; display: block; margin-bottom: 0.15rem; }
+      .status-body { font-size: 0.86rem; }
+      .footer-links { margin-top: 1.5rem; font-size: 0.82rem; display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; color: #9ca3af; }
+      .footer-links a { color: #6b7280; text-decoration: none; font-weight: 500; }
+      .footer-links a:hover { text-decoration: underline; }
+      code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 999px; font-size: 0.8rem; }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="card">
+        <div class="top-row">
+          <div>
+            <h1>Review manual de Merge Request</h1>
+            <p class="subtitle">
+              Genera una review con IA a partir de un enlace de MR de GitLab. La review quedará
+              <strong>en estado pendiente</strong> como draft note, para que puedas revisarla y publicarla cuando quieras.
+            </p>
+          </div>
+          <div class="pill">GitLab · Pending Review</div>
+        </div>
+
+        {% if status %}
+          <div class="status {% if status_type == 'ok' %}status-ok{% elif status_type == 'error' %}status-error{% else %}status-neutral{% endif %}">
+            <span class="status-title">{{ status_title }}</span>
+            <span class="status-body">{{ status }}</span>
+          </div>
+        {% endif %}
+
+        <form method="post" action="/review">
+          <div>
+            <label for="expected_token">Token esperado (seguridad)</label>
+            <input
+              id="expected_token"
+              name="expected_token"
+              type="password"
+              autocomplete="off"
+              required
+              placeholder="Introduce el EXPECTED_GITLAB_TOKEN configurado en el servidor"
+            />
+            <p class="hint">
+              Solo se compara del lado del servidor con <code>EXPECTED_GITLAB_TOKEN</code>. No se persiste ni se reenvía a otros servicios.
+            </p>
+          </div>
+
+          <div>
+            <label for="mr_url">Enlace al Merge Request</label>
+            <input
+              id="mr_url"
+              name="mr_url"
+              type="text"
+              required
+              placeholder="Ej: https://gitlab.com/grupo/proyecto/-/merge_requests/123"
+            />
+            <p class="hint">
+              Usaremos este enlace para obtener el IID del MR e invocar la API de GitLab.
+            </p>
+          </div>
+
+          <div class="actions">
+            <span class="badge">La review se creará como draft note pendiente</span>
+            <button class="btn-primary" type="submit">
+              Generar review con IA
+            </button>
+          </div>
+        </form>
+
+        <div class="footer-links">
+          <span>Webhook: <code>POST /webhook</code></span>
+          <a href="/">Volver al inicio</a>
+        </div>
+      </div>
+    </div>
+  </body>
+  </html>
+"""
+
+
+@app.route("/review", methods=["GET", "POST"])
+def manual_review():
+    """Formulario sencillo de UI para generar una review pendiente a partir de un enlace de MR."""
+    logger.info(f"Solicitud al endpoint /review con método {request.method}")
+
+    if request.method == "GET":
+        return render_template_string(
+            REVIEW_FORM_TEMPLATE,
+            status=None,
+            status_type=None,
+            status_title="",
+        ), 200
+
+    # POST: procesar el formulario
+    expected_token_input = request.form.get("expected_token", "")
+    mr_url = request.form.get("mr_url", "").strip()
+
+    configured_expected_token = os.environ.get("EXPECTED_GITLAB_TOKEN")
+
+    if not configured_expected_token:
+        logger.error("EXPECTED_GITLAB_TOKEN no está configurado en el entorno")
+        return render_template_string(
+            REVIEW_FORM_TEMPLATE,
+            status="El servidor no tiene configurado EXPECTED_GITLAB_TOKEN. Revisa la configuración.",
+            status_type="error",
+            status_title="Configuración incompleta",
+        ), 500
+
+    if expected_token_input != configured_expected_token:
+        logger.warning("Token esperado recibido desde la UI no coincide con EXPECTED_GITLAB_TOKEN")
+        return render_template_string(
+            REVIEW_FORM_TEMPLATE,
+            status="El token proporcionado no coincide con el token esperado. Acceso denegado.",
+            status_type="error",
+            status_title="Token inválido",
+        ), 403
+
+    if not mr_url:
+        logger.warning("No se proporcionó URL de MR en el formulario")
+        return render_template_string(
+            REVIEW_FORM_TEMPLATE,
+            status="Debes proporcionar un enlace válido al Merge Request.",
+            status_type="error",
+            status_title="Enlace faltante",
+        ), 400
+
+    mr_iid = extract_mr_iid_from_url(mr_url)
+    if mr_iid is None:
+        logger.warning(f"No se pudo extraer el IID del MR desde la URL proporcionada: {mr_url}")
+        return render_template_string(
+            REVIEW_FORM_TEMPLATE,
+            status="No se pudo detectar el número de MR a partir del enlace. Verifica que el enlace sea correcto.",
+            status_type="error",
+            status_title="Enlace de MR no válido",
+        ), 400
+
+    try:
+        # Buscar el MR globalmente por IID para obtener el project_id
+        search_url = f"{gitlab_url}/merge_requests"
+        headers = {"Private-Token": gitlab_token}
+        params = {"iid": mr_iid}
+
+        logger.info(f"Buscando MR por IID usando la API de GitLab: {search_url} con iid={mr_iid}")
+        search_response = requests.get(search_url, headers=headers, params=params)
+        logger.info(f"Respuesta de búsqueda de MR - Status: {search_response.status_code}")
+
+        if search_response.status_code != 200:
+            logger.error(f"Error al buscar MR por IID: {search_response.status_code} - {search_response.text}")
+            return render_template_string(
+                REVIEW_FORM_TEMPLATE,
+                status="No se pudo encontrar el Merge Request en GitLab. Revisa que el MR exista y que el token tenga permisos.",
+                status_type="error",
+                status_title="Error buscando el MR",
+            ), 500
+
+        mrs = search_response.json()
+        if not mrs:
+            logger.warning(f"No se encontró ningún MR con IID {mr_iid}")
+            return render_template_string(
+                REVIEW_FORM_TEMPLATE,
+                status="No se encontró ningún Merge Request con ese número de IID. Verifica el enlace.",
+                status_type="error",
+                status_title="MR no encontrado",
+            ), 404
+
+        mr_data = mrs[0]
+        project_id = mr_data.get("project_id")
+        logger.info(f"MR encontrado: IID {mr_iid}, project_id {project_id}")
+
+        if not project_id:
+            logger.error("La respuesta de GitLab no incluye project_id para el MR encontrado")
+            return render_template_string(
+                REVIEW_FORM_TEMPLATE,
+                status="No se pudo determinar el proyecto del Merge Request. Revisa los logs del servidor.",
+                status_type="error",
+                status_title="Datos incompletos del MR",
+            ), 500
+
+        review_body = build_ai_review_for_mr(project_id, mr_iid)
+        create_pending_review_draft_note(project_id, mr_iid, review_body)
+
+        return render_template_string(
+            REVIEW_FORM_TEMPLATE,
+            status=f"Se generó correctamente una review pendiente para el MR !{mr_iid}. Puedes revisarla y publicarla desde GitLab.",
+            status_type="ok",
+            status_title="Review pendiente creada",
+        ), 200
+
+    except Exception as e:
+        logger.error(f"Error inesperado generando review manual para MR {mr_iid}: {e}")
+        return render_template_string(
+            REVIEW_FORM_TEMPLATE,
+            status=f"Ocurrió un error al generar la review: {str(e)}",
+            status_type="error",
+            status_title="Error interno",
+        ), 500
 
 @app.errorhandler(404)
 def not_found(error):
