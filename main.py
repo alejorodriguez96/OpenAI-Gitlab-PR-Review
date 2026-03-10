@@ -319,6 +319,209 @@ def create_pending_review_draft_note(project_id, mr_iid, body):
         raise RuntimeError(f"Error al crear draft note: {response.status_code}")
 
     logger.info("Draft note creado exitosamente; la review queda en estado pendiente.")
+
+
+def build_annotated_diffs_for_ai(mr_changes):
+    """
+    Construye un string con diffs anotados con números de línea reales (lado nuevo)
+    para que OpenAI pueda referenciar archivos y líneas concretas.
+    """
+    annotated_parts = []
+
+    for change in mr_changes.get("changes", []):
+        new_path = change.get("new_path") or change.get("old_path")
+        diff_text = change.get("diff", "")
+
+        if not diff_text:
+            continue
+
+        annotated_parts.append(f"=== FILE: {new_path} ===")
+
+        lines = diff_text.splitlines()
+        new_line = None
+
+        for line in lines:
+            # Cabecera de hunk: @@ -a,b +c,d @@
+            if line.startswith("@@"):
+                try:
+                    header = line.split("@@")[1].strip()
+                    # header ej: "-10,7 +10,9"
+                    plus_part = [p for p in header.split(" ") if p.startswith("+")][0]
+                    plus_numbers = plus_part[1:]  # sin el '+'
+                    if "," in plus_numbers:
+                        start_new = int(plus_numbers.split(",")[0])
+                    else:
+                        start_new = int(plus_numbers)
+                    new_line = start_new
+                except Exception as e:
+                    logger.error(f"No se pudo parsear cabecera de hunk '{line}': {e}")
+                    new_line = None
+
+                annotated_parts.append(line)
+                continue
+
+            if new_line is None:
+                annotated_parts.append(line)
+                continue
+
+            prefix = line[:1]
+            content = line[1:]
+
+            if prefix == "+":
+                # Línea nueva: tiene número de línea nuevo
+                annotated_parts.append(f"[{new_line}] +{content}")
+                new_line += 1
+            elif prefix == " ":
+                # Contexto: también tiene línea nueva
+                annotated_parts.append(f"[{new_line}]  {content}")
+                new_line += 1
+            elif prefix == "-":
+                # Línea borrada: no incrementa new_line
+                annotated_parts.append(f"      -{content}")
+            else:
+                annotated_parts.append(line)
+
+        annotated_parts.append("")  # separador entre archivos
+
+    return "\n".join(annotated_parts)
+
+
+def generate_inline_draft_notes_for_mr(project_id, mr_iid):
+    """
+    Usa OpenAI para sugerir comentarios inline y los crea como draft notes
+    en el MR correspondiente (quedan en pending).
+    """
+    try:
+        # 1) Obtener información del MR (incluye diff_refs)
+        mr_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}"
+        headers = {"Private-Token": gitlab_token}
+
+        logger.info(f"Obteniendo información del MR para inline comments: {mr_url}")
+        mr_resp = requests.get(mr_url, headers=headers)
+        logger.info(f"Respuesta MR info - Status: {mr_resp.status_code}")
+
+        if mr_resp.status_code != 200:
+            logger.error(f"No se pudo obtener info del MR: {mr_resp.status_code} - {mr_resp.text}")
+            return
+
+        mr_data = mr_resp.json()
+        diff_refs = mr_data.get("diff_refs") or {}
+        base_sha = diff_refs.get("base_sha")
+        start_sha = diff_refs.get("start_sha")
+        head_sha = diff_refs.get("head_sha")
+
+        if not (base_sha and start_sha and head_sha):
+            logger.error("diff_refs incompletos; no se pueden crear inline comments.")
+            return
+
+        # 2) Obtener cambios del MR
+        changes_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}/changes"
+        logger.info(f"Obteniendo cambios del MR para inline comments: {changes_url}")
+        changes_resp = requests.get(changes_url, headers=headers)
+        logger.info(f"Respuesta MR changes (inline) - Status: {changes_resp.status_code}")
+
+        if changes_resp.status_code != 200:
+            logger.error(f"No se pudieron obtener cambios del MR: {changes_resp.status_code} - {changes_resp.text}")
+            return
+
+        mr_changes = changes_resp.json()
+        annotated_diffs = build_annotated_diffs_for_ai(mr_changes)
+
+        if not annotated_diffs.strip():
+            logger.info("No hay diffs anotados para enviar a OpenAI (inline comments).")
+            return
+
+        # 3) Llamar a OpenAI para obtener sugerencias de comentarios inline
+        inline_prompt = """
+Eres un revisor de código senior. A continuación verás diffs de GitLab
+con números de línea reales anotados entre corchetes, por ejemplo:
+
+=== FILE: src/app.py ===
+@@ -10,7 +10,9 @@
+[42] +def nueva_funcion():
+
+Genera comentarios SOLO en las partes donde realmente haya algo importante
+que revisar (bugs potenciales, problemas serios de diseño, seguridad, etc.).
+
+Responde ÚNICAMENTE con un JSON válido de la forma:
+{
+  "comments": [
+    {
+      "file_path": "ruta/archivo.py",
+      "new_line": 42,
+      "text": "Comentario conciso en español para esa línea."
+    }
+  ]
+}
+
+Reglas:
+- Usa exactamente las rutas de archivo que aparecen después de "=== FILE: ... ===".
+- Usa exactamente los números de línea que aparecen entre corchetes [].
+- No repitas el comentario general del MR.
+- Si no tienes nada importante que comentar inline, responde {"comments": []}.
+"""
+
+        input_text = f"{inline_prompt}\n\n{annotated_diffs}"
+
+        logger.info("Enviando solicitud a OpenAI para generar comentarios inline...")
+        response = openai_client.responses.create(
+            model=os.environ.get("OPENAI_API_MODEL") or "gpt-3.5-turbo",
+            input=input_text,
+            instructions="Devuelve SOLO JSON válido, sin texto adicional.",
+        )
+        raw_output = response.output_text.strip()
+        logger.info(f"Respuesta de OpenAI (inline) recibida, longitud: {len(raw_output)}")
+
+        try:
+            parsed = json.loads(raw_output)
+        except json.JSONDecodeError as e:
+            logger.error(f"No se pudo parsear la respuesta de OpenAI como JSON para inline comments: {e}")
+            logger.error(f"Respuesta cruda: {raw_output[:500]}...")
+            return
+
+        comments = parsed.get("comments") or []
+        if not comments:
+            logger.info("OpenAI no sugirió comentarios inline adicionales.")
+            return
+
+        logger.info(f"Se recibieron {len(comments)} comentarios inline sugeridos por OpenAI.")
+
+        # 4) Crear draft notes inline en GitLab
+        draft_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}/draft_notes"
+
+        for idx, c in enumerate(comments):
+            try:
+                file_path = c.get("file_path")
+                new_line = c.get("new_line")
+                text = c.get("text", "").strip()
+
+                if not (file_path and isinstance(new_line, int) and text):
+                    logger.warning(f"Comentario inline #{idx} inválido o incompleto: {c}")
+                    continue
+
+                payload = {
+                    "note": text,
+                    "position": {
+                        "position_type": "text",
+                        "base_sha": base_sha,
+                        "start_sha": start_sha,
+                        "head_sha": head_sha,
+                        "new_path": file_path,
+                        "new_line": new_line,
+                    },
+                }
+
+                logger.info(f"Creando draft note inline para {file_path}:{new_line}")
+                draft_resp = requests.post(draft_url, headers=headers, json=payload)
+                logger.info(f"Respuesta draft note inline - Status: {draft_resp.status_code}")
+
+                if draft_resp.status_code != 201:
+                    logger.error(f"Error al crear draft note inline: {draft_resp.text}")
+            except Exception as e:
+                logger.error(f"Error al procesar comentario inline #{idx}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error inesperado generando comentarios inline para MR {mr_iid}: {e}")
 def process_push_event(payload):
     """Procesa eventos de Push"""
     try:
@@ -748,10 +951,16 @@ def manual_review():
 
         review_body = build_ai_review_for_mr(project_id, mr_iid)
         create_pending_review_draft_note(project_id, mr_iid, review_body)
+        # Comentarios inline (quedan también como draft notes, en pending)
+        generate_inline_draft_notes_for_mr(project_id, mr_iid)
 
         return render_template_string(
             REVIEW_FORM_TEMPLATE,
-            status=f"Se generó correctamente una review pendiente para el MR !{mr_iid}. Puedes revisarla y publicarla desde GitLab.",
+            status=(
+                f"Se generó correctamente una review pendiente para el MR !{mr_iid}, "
+                "incluyendo un comentario general y comentarios inline en el código donde corresponde. "
+                "Puedes revisarlos y publicarlos desde GitLab."
+            ),
             status_type="ok",
             status_title="Review pendiente creada",
         ), 200
