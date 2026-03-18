@@ -260,7 +260,7 @@ def extract_project_path_and_iid_from_url(mr_url):
         return None, None
 
 
-def build_ai_review_for_mr(project_id, mr_iid, extra_context=None):
+def build_ai_review_for_mr(project_id, mr_iid, extra_context=None, private_token=None):
     """Genera el texto de la review de MR usando OpenAI.
 
     Si se proporciona `extra_context`, este se añadirá al prompt para que el modelo
@@ -269,7 +269,7 @@ def build_ai_review_for_mr(project_id, mr_iid, extra_context=None):
     changes_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}/changes"
     logger.info(f"URL de cambios para review manual: {changes_url}")
 
-    headers = {"Private-Token": gitlab_token}
+    headers = {"Private-Token": private_token or gitlab_token}
     logger.info("Obteniendo cambios del MR desde GitLab (review manual)...")
 
     response = requests.get(changes_url, headers=headers)
@@ -357,10 +357,10 @@ def build_ai_review_for_mr(project_id, mr_iid, extra_context=None):
     return answer
 
 
-def create_pending_review_draft_note(project_id, mr_iid, body):
+def create_pending_review_draft_note(project_id, mr_iid, body, private_token=None):
     """Crea un draft note en el MR, dejando la review en estado pendiente."""
     draft_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}/draft_notes"
-    headers = {"Private-Token": gitlab_token}
+    headers = {"Private-Token": private_token or gitlab_token}
     payload = {"note": body}
 
     logger.info(f"Creando draft note (review pendiente) en: {draft_url}")
@@ -439,7 +439,7 @@ def build_annotated_diffs_for_ai(mr_changes):
     return "\n".join(annotated_parts)
 
 
-def generate_inline_draft_notes_for_mr(project_id, mr_iid):
+def generate_inline_draft_notes_for_mr(project_id, mr_iid, private_token=None):
     """
     Usa OpenAI para sugerir comentarios inline y los crea como draft notes
     en el MR correspondiente (quedan en pending).
@@ -447,7 +447,7 @@ def generate_inline_draft_notes_for_mr(project_id, mr_iid):
     try:
         # 1) Obtener información del MR (incluye diff_refs)
         mr_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}"
-        headers = {"Private-Token": gitlab_token}
+        headers = {"Private-Token": private_token or gitlab_token}
 
         logger.info(f"Obteniendo información del MR para inline comments: {mr_url}")
         mr_resp = requests.get(mr_url, headers=headers)
@@ -904,6 +904,21 @@ REVIEW_FORM_TEMPLATE = """
           </div>
 
           <div>
+            <label for="gitlab_token">Token de GitLab (opcional)</label>
+            <input
+              id="gitlab_token"
+              name="gitlab_token"
+              type="password"
+              autocomplete="off"
+              placeholder="Deja vacío para usar el token configurado en el servidor"
+            />
+            <p class="hint">
+              Si lo completas, este token se usará solo para esta review manual. Si lo dejas vacío, se utilizará el
+              <code>GITLAB_TOKEN</code> configurado en el entorno del servidor.
+            </p>
+          </div>
+
+          <div>
             <label for="extra_context">Contexto adicional para la review (opcional)</label>
             <textarea
               id="extra_context"
@@ -969,6 +984,7 @@ def manual_review():
     # POST: procesar el formulario
     expected_token_input = request.form.get("expected_token", "")
     mr_url = request.form.get("mr_url", "").strip()
+    gitlab_token_from_form = request.form.get("gitlab_token", "").strip()
 
     configured_expected_token = os.environ.get("EXPECTED_GITLAB_TOKEN")
 
@@ -1011,7 +1027,8 @@ def manual_review():
 
     try:
         # Resolver el proyecto a partir del path del enlace del MR
-        headers = {"Private-Token": gitlab_token}
+        effective_gitlab_token = gitlab_token_from_form or gitlab_token
+        headers = {"Private-Token": effective_gitlab_token}
         project_api_url = f"{gitlab_url}/projects/{requests.utils.quote(project_path, safe='')}"
 
         logger.info(
@@ -1053,10 +1070,10 @@ def manual_review():
         extra_context = request.form.get("extra_context", "").strip()
         logger.info(f"Extra context: {extra_context}")
 
-        review_body = build_ai_review_for_mr(project_id, mr_iid, extra_context or None)
-        create_pending_review_draft_note(project_id, mr_iid, review_body)
+        review_body = build_ai_review_for_mr(project_id, mr_iid, extra_context or None, private_token=effective_gitlab_token)
+        create_pending_review_draft_note(project_id, mr_iid, review_body, private_token=effective_gitlab_token)
         # Comentarios inline (quedan también como draft notes, en pending)
-        generate_inline_draft_notes_for_mr(project_id, mr_iid)
+        generate_inline_draft_notes_for_mr(project_id, mr_iid, private_token=effective_gitlab_token)
 
         return render_template_string(
             REVIEW_FORM_TEMPLATE,
