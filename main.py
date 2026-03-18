@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import logging
+from urllib.parse import urlparse
 from flask import Flask, request, render_template_string
 from openai import OpenAI
 
@@ -209,24 +210,62 @@ def process_merge_request(payload):
         return f"Error procesando MR: {e}", 500
 
 
-def extract_mr_iid_from_url(mr_url):
-    """Extrae el IID del MR desde una URL de GitLab."""
+def extract_project_path_and_iid_from_url(mr_url):
+    """
+    Extrae el path del proyecto y el IID del MR desde una URL de GitLab.
+    Ejemplos válidos:
+      - https://gitlab.com/grupo/proyecto/-/merge_requests/123
+      - https://gitlab.com/grupo/subgrupo/proyecto/merge_requests/123
+    Retorna (project_path, mr_iid) o (None, None) si falla.
+    """
     try:
-        # Ejemplos válidos:
-        # https://gitlab.com/grupo/proyecto/-/merge_requests/123
-        # https://gitlab.com/grupo/proyecto/merge_requests/123
-        parts = mr_url.rstrip("/").split("/")
-        iid_str = parts[-1]
+        parsed = urlparse(mr_url)
+        path = parsed.path.rstrip("/")
+        # Eliminamos el prefijo inicial "/"
+        if path.startswith("/"):
+            path = path[1:]
+
+        segments = path.split("/")
+        if "merge_requests" not in segments:
+            logger.error(f"La URL de MR no contiene 'merge_requests': {mr_url}")
+            return None, None
+
+        idx = segments.index("merge_requests")
+        if idx == 0 or idx == len(segments) - 1:
+            logger.error(f"No se pudo determinar project_path o IID desde la URL: {mr_url}")
+            return None, None
+
+        iid_str = segments[idx + 1]
         if not iid_str.isdigit():
-            return None
-        return int(iid_str)
+            logger.error(f"El IID del MR no es numérico en la URL: {mr_url}")
+            return None, None
+
+        mr_iid = int(iid_str)
+
+        # project_path son todos los segmentos antes de "merge_requests" (ignorando posible '-')
+        project_segments = segments[:idx]
+        if project_segments and project_segments[-1] == "-":
+            project_segments = project_segments[:-1]
+
+        project_path = "/".join(project_segments)
+        if not project_path:
+            logger.error(f"No se pudo determinar project_path desde la URL: {mr_url}")
+            return None, None
+
+        logger.info(f"Extraído desde URL de MR -> project_path='{project_path}', iid={mr_iid}")
+        return project_path, mr_iid
+
     except Exception as e:
-        logger.error(f"No se pudo extraer el IID del MR desde la URL '{mr_url}': {e}")
-        return None
+        logger.error(f"No se pudo extraer project_path e IID del MR desde la URL '{mr_url}': {e}")
+        return None, None
 
 
-def build_ai_review_for_mr(project_id, mr_iid):
-    """Genera el texto de la review de MR usando OpenAI."""
+def build_ai_review_for_mr(project_id, mr_iid, extra_context=None):
+    """Genera el texto de la review de MR usando OpenAI.
+
+    Si se proporciona `extra_context`, este se añadirá al prompt para que el modelo
+    tenga en cuenta información adicional como rúbricas o criterios de evaluación.
+    """
     changes_url = f"{gitlab_url}/projects/{project_id}/merge_requests/{mr_iid}/changes"
     logger.info(f"URL de cambios para review manual: {changes_url}")
 
@@ -246,23 +285,37 @@ def build_ai_review_for_mr(project_id, mr_iid):
     diffs = [change["diff"] for change in mr_changes.get("changes", [])]
     logger.info(f"Total de diffs: {len(diffs)}")
 
-    pre_prompt = (
+    base_prompt = (
         "Revisa los siguientes cambios de código git diff, enfocándote en estructura, seguridad, claridad, "
         "arquitectura hexagonal, separación de responsabilidades y orientación a objetos."
     )
 
+    if extra_context:
+        pre_prompt = (
+            "Estás corrigiendo un ejercicio siguiendo la siguiente rúbrica, contexto y criterios de evaluación.\n"
+            "Tu prioridad absoluta es ajustar la review a estos criterios, haciendo referencias explícitas a ellos "
+            "cuando comentes sobre el código.\n\n"
+            "CONTEXTO DEL EJERCICIO / RÚBRICA:\n"
+            f"{extra_context}\n\n"
+            "Además de ese contexto, también debes tener en cuenta lo siguiente sobre los cambios de código:\n"
+            f"{base_prompt}"
+        )
+    else:
+        pre_prompt = base_prompt
+
     questions = """
     Preguntas:
     1. Resume los cambios principales.
-    2. ¿Es claro el código nuevo/modificado?
-    3. ¿Son descriptivos los comentarios y nombres?
-    4. ¿Se puede reducir la complejidad? ¿Ejemplos?
-    5. ¿Algún bug? ¿Dónde?
-    6. ¿Problemas de seguridad potenciales?
-    7. ¿Los cambios respetan la arquitectura hexagonal (puertos y adaptadores)?
-    8. ¿Hay una adecuada separación de incumbencias (responsabilidades)?
-    9. ¿El código está bien orientado a objetos (encapsulación, herencia, polimorfismo)?
-    10. ¿Sugerencias para alineación con mejores prácticas?
+    2. Evalua los puntos de la rúbrica, si está disponible.
+    3. ¿Es claro el código nuevo/modificado?
+    4. ¿Son descriptivos los comentarios y nombres?
+    5. ¿Se puede reducir la complejidad? ¿Ejemplos?
+    6. ¿Algún bug? ¿Dónde?
+    7. ¿Problemas de seguridad potenciales?
+    8. ¿Los cambios respetan la arquitectura hexagonal (puertos y adaptadores)?
+    9. ¿Hay una adecuada separación de incumbencias (responsabilidades)?
+    10. ¿El código está bien orientado a objetos (encapsulación, herencia, polimorfismo)?
+    11. ¿Sugerencias para alineación con mejores prácticas?
     """
 
     input_text = f"{pre_prompt}\n\n{''.join(diffs)}{questions}"
@@ -737,6 +790,24 @@ REVIEW_FORM_TEMPLATE = """
         transform: translateY(0);
         box-shadow: 0 10px 24px rgba(37,99,235,0.3);
       }
+      .btn-primary[disabled],
+      .btn-primary.loading {
+        opacity: 0.8;
+        cursor: not-allowed;
+        box-shadow: 0 10px 24px rgba(37,99,235,0.25);
+      }
+      .spinner {
+        width: 14px;
+        height: 14px;
+        border-radius: 999px;
+        border: 2px solid rgba(239,246,255,0.7);
+        border-top-color: #ffffff;
+        animation: spin 0.7s linear infinite;
+      }
+      @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
       .badge {
         display: inline-flex;
         align-items: center;
@@ -832,6 +903,20 @@ REVIEW_FORM_TEMPLATE = """
             </p>
           </div>
 
+          <div>
+            <label for="extra_context">Contexto adicional para la review (opcional)</label>
+            <textarea
+              id="extra_context"
+              name="extra_context"
+              rows="4"
+              placeholder="Por ejemplo: rúbrica del ejercicio, criterios de corrección, nivel esperado del alumno, restricciones específicas, etc."
+              style="width: 100%; padding: 0.6rem 0.75rem; border-radius: 0.6rem; border: 1px solid #d1d5db; font-size: 0.95rem; outline: none; background: #f9fafb; resize: vertical; min-height: 80px;"
+            ></textarea>
+            <p class="hint">
+              Este texto se enviará junto con el diff al modelo para adaptar la review al contexto de tu ejercicio.
+            </p>
+          </div>
+
           <div class="actions">
             <span class="badge">La review se creará como draft note pendiente</span>
             <button class="btn-primary" type="submit">
@@ -846,6 +931,23 @@ REVIEW_FORM_TEMPLATE = """
         </div>
       </div>
     </div>
+    <script>
+      document.addEventListener('DOMContentLoaded', function () {
+        const form = document.querySelector('form');
+        if (!form) return;
+        const submitBtn = form.querySelector('.btn-primary');
+        if (!submitBtn) return;
+
+        form.addEventListener('submit', function () {
+          if (submitBtn.classList.contains('loading')) {
+            return;
+          }
+          submitBtn.classList.add('loading');
+          submitBtn.disabled = true;
+          submitBtn.innerHTML = '<span class="spinner"></span><span>Generando review...</span>';
+        });
+      });
+    </script>
   </body>
   </html>
 """
@@ -897,59 +999,61 @@ def manual_review():
             status_title="Enlace faltante",
         ), 400
 
-    mr_iid = extract_mr_iid_from_url(mr_url)
-    if mr_iid is None:
-        logger.warning(f"No se pudo extraer el IID del MR desde la URL proporcionada: {mr_url}")
+    project_path, mr_iid = extract_project_path_and_iid_from_url(mr_url)
+    if project_path is None or mr_iid is None:
+        logger.warning(f"No se pudo extraer project_path/IID del MR desde la URL proporcionada: {mr_url}")
         return render_template_string(
             REVIEW_FORM_TEMPLATE,
-            status="No se pudo detectar el número de MR a partir del enlace. Verifica que el enlace sea correcto.",
+            status="No se pudo detectar el proyecto y número de MR a partir del enlace. Verifica que el enlace sea correcto.",
             status_type="error",
             status_title="Enlace de MR no válido",
         ), 400
 
     try:
-        # Buscar el MR globalmente por IID para obtener el project_id
-        search_url = f"{gitlab_url}/merge_requests"
+        # Resolver el proyecto a partir del path del enlace del MR
         headers = {"Private-Token": gitlab_token}
-        params = {"iid": mr_iid}
+        project_api_url = f"{gitlab_url}/projects/{requests.utils.quote(project_path, safe='')}"
 
-        logger.info(f"Buscando MR por IID usando la API de GitLab: {search_url} con iid={mr_iid}")
-        search_response = requests.get(search_url, headers=headers, params=params)
-        logger.info(f"Respuesta de búsqueda de MR - Status: {search_response.status_code}")
+        logger.info(
+            f"Resolviendo project_id a partir del path del proyecto de la URL del MR: "
+            f"project_path='{project_path}', url={project_api_url}"
+        )
+        project_resp = requests.get(project_api_url, headers=headers)
+        logger.info(f"Respuesta de resolución de proyecto - Status: {project_resp.status_code}")
 
-        if search_response.status_code != 200:
-            logger.error(f"Error al buscar MR por IID: {search_response.status_code} - {search_response.text}")
+        if project_resp.status_code != 200:
+            logger.error(
+                f"Error al obtener proyecto desde path '{project_path}': "
+                f"{project_resp.status_code} - {project_resp.text}"
+            )
             return render_template_string(
                 REVIEW_FORM_TEMPLATE,
-                status="No se pudo encontrar el Merge Request en GitLab. Revisa que el MR exista y que el token tenga permisos.",
+                status=(
+                    "No se pudo resolver el proyecto a partir del enlace del MR. "
+                    "Verifica que el enlace corresponda al mismo GitLab configurado en GITLAB_URL "
+                    "y que el token tenga acceso al proyecto."
+                ),
                 status_type="error",
-                status_title="Error buscando el MR",
-            ), 500
-
-        mrs = search_response.json()
-        if not mrs:
-            logger.warning(f"No se encontró ningún MR con IID {mr_iid}")
-            return render_template_string(
-                REVIEW_FORM_TEMPLATE,
-                status="No se encontró ningún Merge Request con ese número de IID. Verifica el enlace.",
-                status_type="error",
-                status_title="MR no encontrado",
+                status_title="Proyecto no encontrado",
             ), 404
 
-        mr_data = mrs[0]
-        project_id = mr_data.get("project_id")
-        logger.info(f"MR encontrado: IID {mr_iid}, project_id {project_id}")
+        project_data = project_resp.json()
+        project_id = project_data.get("id")
+        logger.info(f"Proyecto resuelto desde path '{project_path}': project_id={project_id}")
 
         if not project_id:
-            logger.error("La respuesta de GitLab no incluye project_id para el MR encontrado")
+            logger.error("La respuesta de GitLab no incluye id para el proyecto resuelto")
             return render_template_string(
                 REVIEW_FORM_TEMPLATE,
-                status="No se pudo determinar el proyecto del Merge Request. Revisa los logs del servidor.",
+                status="No se pudo determinar el ID del proyecto del Merge Request. Revisa los logs del servidor.",
                 status_type="error",
                 status_title="Datos incompletos del MR",
             ), 500
 
-        review_body = build_ai_review_for_mr(project_id, mr_iid)
+        extra_context = request.form.get("extra_context", "").strip()
+        logger.info(f"Extra context: {extra_context}")
+
+        review_body = build_ai_review_for_mr(project_id, mr_iid, extra_context or None)
         create_pending_review_draft_note(project_id, mr_iid, review_body)
         # Comentarios inline (quedan también como draft notes, en pending)
         generate_inline_draft_notes_for_mr(project_id, mr_iid)

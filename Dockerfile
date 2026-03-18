@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 80
 
-CMD ["gunicorn", "--bind", "0.0.0.0:80", "main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:80", "--timeout", "500", "main:app"]
